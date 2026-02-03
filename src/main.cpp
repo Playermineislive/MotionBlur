@@ -1,392 +1,246 @@
 #include <jni.h>
 #include <android/log.h>
-#include <android/input.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <GLES3/gl3.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <dlfcn.h>
-#include <string.h>
-#include <vector>
-#include <algorithm>
+#include <cmath>
 
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
 
-#include "ImGui/imgui.h"
-#include "ImGui/backends/imgui_impl_opengl3.h"
-#include "ImGui/backends/imgui_impl_android.h"
+// =============================================================
+// 1. SETTINGS
+// =============================================================
+static const float BLUR_STRENGTH = 0.60f; // 0.60 is the sweet spot for PvP
+static const float SCALE = 0.5f;          // Render at 50% resolution (Huge FPS Boost)
 
-const char* vertexShaderSource = R"(
-attribute vec4 aPosition;
-attribute vec2 aTexCoord;
-varying vec2 vTexCoord;
+// =============================================================
+// 2. ULTRA-FAST SHADERS (Low Precision)
+// =============================================================
+
+const char* vertexShaderSource = R"(#version 300 es
+layout(location = 0) in vec4 aPosition;
+layout(location = 1) in vec2 aTexCoord;
+// OPTIMIZATION: Use mediump for coordinates (GLES2 trick)
+out mediump vec2 vTexCoord; 
 void main() {
     gl_Position = aPosition;
     vTexCoord = aTexCoord;
 }
 )";
 
-const char* blendFragmentShaderSource = R"(
+const char* smartFragmentShaderSource = R"(#version 300 es
 precision mediump float;
-varying vec2 vTexCoord;
+in mediump vec2 vTexCoord;
 uniform sampler2D uCurrentFrame;
 uniform sampler2D uHistoryFrame;
-uniform float uBlendFactor;
+uniform lowp float uBlendFactor; // lowp is enough for simple 0-1 range
+out vec4 FragColor;
+
 void main() {
-    vec4 current = texture2D(uCurrentFrame, vTexCoord);
-    vec4 history = texture2D(uHistoryFrame, vTexCoord);
-    vec4 result = mix(current, history, uBlendFactor);
-    gl_FragColor = vec4(result.rgb, 1.0);
+    // OPTIMIZATION: Use lowp for colors (Faster on Mali/Adreno GPUs)
+    lowp vec4 current = texture(uCurrentFrame, vTexCoord);
+    lowp vec4 history = texture(uHistoryFrame, vTexCoord);
+
+    // Fast difference check (Manhattan Distance - No Sqrt)
+    lowp vec3 diffVec = abs(current.rgb - history.rgb);
+    lowp float diff = diffVec.r + diffVec.g + diffVec.b;
+
+    lowp float smartFactor = uBlendFactor;
+    
+    // SMART LOGIC: If difference > 0.4 (Menu Opened), drop blur to 0.
+    if (diff > 0.4) { 
+        smartFactor = 0.0;
+    }
+
+    FragColor = mix(current, history, smartFactor); 
 }
 )";
 
-const char* drawFragmentShaderSource = R"(
+const char* drawFragmentShaderSource = R"(#version 300 es
 precision mediump float;
-varying vec2 vTexCoord;
+in mediump vec2 vTexCoord;
 uniform sampler2D uTexture;
+out vec4 FragColor;
 void main() {
-    vec4 color = texture2D(uTexture, vTexCoord);
-    gl_FragColor = vec4(color.rgb, 1.0);
+    FragColor = texture(uTexture, vTexCoord);
 }
 )";
 
-static bool motion_blur_enabled = false;
-static float blur_strength = 0.85f;
+// =============================================================
+// 3. GLOBAL VARIABLES
+// =============================================================
 
-static GLuint rawTexture = 0;
+static GLuint rawTexture = 0, rawFBO = 0;
 static GLuint historyTextures[2] = {0, 0};
 static GLuint historyFBOs[2] = {0, 0};
+static GLuint vao = 0, vbo = 0, ibo = 0;
+
+static GLuint blendProgram = 0, drawProgram = 0;
+static GLint locCurrent = -1, locHistory = -1, locFactor = -1, locTexture = -1;
+
 static int pingPongIndex = 0;
 static bool isFirstFrame = true;
+static int savedWidth = 0, savedHeight = 0;
+static int internalW = 0, internalH = 0;
 
-static GLuint blendShaderProgram = 0;
-static GLint blendPosLoc = -1;
-static GLint blendTexCoordLoc = -1;
-static GLint blendCurrentLoc = -1;
-static GLint blendHistoryLoc = -1;
-static GLint blendFactorLoc = -1;
+// =============================================================
+// 4. RESOURCE INITIALIZATION
+// =============================================================
 
-static GLuint drawShaderProgram = 0;
-static GLint drawPosLoc = -1;
-static GLint drawTexCoordLoc = -1;
-static GLint drawTextureLoc = -1;
-
-static GLuint vertexBuffer = 0;
-static GLuint indexBuffer = 0;
-
-static int blur_res_width = 0;
-static int blur_res_height = 0;
-
-void initializeMotionBlurResources(GLint width, GLint height) {
+void initResources(int width, int height) {
     if (rawTexture != 0) {
-        glDeleteTextures(1, &rawTexture);
-        glDeleteTextures(2, historyTextures);
-        glDeleteFramebuffers(2, historyFBOs);
+        glDeleteTextures(1, &rawTexture); glDeleteFramebuffers(1, &rawFBO);
+        glDeleteTextures(2, historyTextures); glDeleteFramebuffers(2, historyFBOs);
+        glDeleteVertexArrays(1, &vao);
     }
 
-    if (blendShaderProgram == 0) {
-        GLuint vs = glCreateShader(GL_VERTEX_SHADER);
-        glShaderSource(vs, 1, &vertexShaderSource, nullptr);
-        glCompileShader(vs);
+    // CALCULATE SCALED RESOLUTION
+    internalW = (int)(width * SCALE);
+    internalH = (int)(height * SCALE);
 
-        GLuint fsBlend = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(fsBlend, 1, &blendFragmentShaderSource, nullptr);
-        glCompileShader(fsBlend);
+    auto compile = [](GLenum type, const char* src) {
+        GLuint s = glCreateShader(type); glShaderSource(s, 1, &src, 0); glCompileShader(s); return s;
+    };
+    GLuint vs = compile(GL_VERTEX_SHADER, vertexShaderSource);
+    GLuint fsBlend = compile(GL_FRAGMENT_SHADER, smartFragmentShaderSource);
+    GLuint fsDraw = compile(GL_FRAGMENT_SHADER, drawFragmentShaderSource);
 
-        blendShaderProgram = glCreateProgram();
-        glAttachShader(blendShaderProgram, vs);
-        glAttachShader(blendShaderProgram, fsBlend);
-        glLinkProgram(blendShaderProgram);
+    blendProgram = glCreateProgram();
+    glAttachShader(blendProgram, vs); glAttachShader(blendProgram, fsBlend); glLinkProgram(blendProgram);
+    locCurrent = glGetUniformLocation(blendProgram, "uCurrentFrame");
+    locHistory = glGetUniformLocation(blendProgram, "uHistoryFrame");
+    locFactor = glGetUniformLocation(blendProgram, "uBlendFactor");
 
-        blendPosLoc = glGetAttribLocation(blendShaderProgram, "aPosition");
-        blendTexCoordLoc = glGetAttribLocation(blendShaderProgram, "aTexCoord");
-        blendCurrentLoc = glGetUniformLocation(blendShaderProgram, "uCurrentFrame");
-        blendHistoryLoc = glGetUniformLocation(blendShaderProgram, "uHistoryFrame");
-        blendFactorLoc = glGetUniformLocation(blendShaderProgram, "uBlendFactor");
+    drawProgram = glCreateProgram();
+    glAttachShader(drawProgram, vs); glAttachShader(drawProgram, fsDraw); glLinkProgram(drawProgram);
+    locTexture = glGetUniformLocation(drawProgram, "uTexture");
 
-        GLuint fsDraw = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(fsDraw, 1, &drawFragmentShaderSource, nullptr);
-        glCompileShader(fsDraw);
+    // Standard Geometry (Full Screen Quad)
+    GLfloat verts[] = { -1,1,0,1,  -1,-1,0,0,  1,-1,1,0,  1,1,1,1 };
+    GLushort inds[] = { 0,1,2, 0,2,3 };
+    
+    glGenVertexArrays(1, &vao); glBindVertexArray(vao);
+    glGenBuffers(1, &vbo); glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+    glGenBuffers(1, &ibo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(inds), inds, GL_STATIC_DRAW);
+    
+    glEnableVertexAttribArray(0); glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, 0);
+    glEnableVertexAttribArray(1); glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, (void*)8);
+    glBindVertexArray(0);
 
-        drawShaderProgram = glCreateProgram();
-        glAttachShader(drawShaderProgram, vs);
-        glAttachShader(drawShaderProgram, fsDraw);
-        glLinkProgram(drawShaderProgram);
-
-        drawPosLoc = glGetAttribLocation(drawShaderProgram, "aPosition");
-        drawTexCoordLoc = glGetAttribLocation(drawShaderProgram, "aTexCoord");
-        drawTextureLoc = glGetUniformLocation(drawShaderProgram, "uTexture");
-
-        GLfloat vertices[] = { 
-            -1.0f, 1.0f, 0.0f, 1.0f, 
-            -1.0f, -1.0f, 0.0f, 0.0f, 
-            1.0f, -1.0f, 1.0f, 0.0f, 
-            1.0f, 1.0f, 1.0f, 1.0f 
-        };
-        GLushort indices[] = { 0, 1, 2, 0, 2, 3 };
-
-        glGenBuffers(1, &vertexBuffer);
-        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-
-        glGenBuffers(1, &indexBuffer);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
-    }
-
-    glGenTextures(1, &rawTexture);
-    glBindTexture(GL_TEXTURE_2D, rawTexture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    glGenTextures(2, historyTextures);
-    glGenFramebuffers(2, historyFBOs);
-
-    for (int i = 0; i < 2; i++) {
-        glBindTexture(GL_TEXTURE_2D, historyTextures[i]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    // TEXTURE SETUP (Scaled Down)
+    auto setupTex = [&](GLuint& tex, GLuint& fbo) {
+        glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex);
+        // CRITICAL: Use internalW/internalH (Smaller)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, internalW, internalH, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         
-        glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[i]);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, historyTextures[i], 0);
-        glClearColor(0, 0, 0, 1);
-        glClear(GL_COLOR_BUFFER_BIT);
+        glGenFramebuffers(1, &fbo); glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    };
+
+    setupTex(rawTexture, rawFBO);
+    for(int i=0; i<2; i++) {
+        setupTex(historyTextures[i], historyFBOs[i]);
+        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT); // Clear Alpha Channel
     }
 
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    blur_res_width = width;
-    blur_res_height = height;
-    pingPongIndex = 0;
+    savedWidth = width; savedHeight = height;
     isFirstFrame = true;
 }
 
-void apply_motion_blur(int width, int height) {
-    if (width != blur_res_width || height != blur_res_height || rawTexture == 0) {
-        initializeMotionBlurResources(width, height);
-    }
+// =============================================================
+// 5. RENDER PIPELINE
+// =============================================================
 
-    glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
+void render_effect(int width, int height) {
+    if (width != savedWidth || height != savedHeight || rawTexture == 0) initResources(width, height);
 
-    glBindTexture(GL_TEXTURE_2D, rawTexture);
-    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, width, height, 0);
+    GLint lastFBO; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &lastFBO);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND);
 
+    // 1. DOWNSCALE & COPY (Fast Blit)
+    // Screen (High Res) -> Texture (Low Res)
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rawFBO);
+    glBlitFramebuffer(0, 0, width, height, 0, 0, internalW, internalH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+    // 2. APPLY BLUR (At Low Res)
     int curr = pingPongIndex;
     int prev = 1 - pingPongIndex;
+    glBindVertexArray(vao);
+    glViewport(0, 0, internalW, internalH); // Render at small scale
 
     if (isFirstFrame) {
         glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[curr]);
-        glViewport(0, 0, width, height);
-        
-        glUseProgram(drawShaderProgram);
-        
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, rawTexture);
-        glUniform1i(drawTextureLoc, 0);
-        
-        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
-        
-        glEnableVertexAttribArray(drawPosLoc);
-        glVertexAttribPointer(drawPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
-        glEnableVertexAttribArray(drawTexCoordLoc);
-        glVertexAttribPointer(drawTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
-        
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
-        
+        glUseProgram(drawProgram);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, rawTexture);
+        glUniform1i(locTexture, 0);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
         isFirstFrame = false;
     } else {
         glBindFramebuffer(GL_FRAMEBUFFER, historyFBOs[curr]);
-        glViewport(0, 0, width, height);
-        
-        glUseProgram(blendShaderProgram);
-
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, rawTexture);
-        glUniform1i(blendCurrentLoc, 0);
-
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, historyTextures[prev]);
-        glUniform1i(blendHistoryLoc, 1);
-
-        glUniform1f(blendFactorLoc, blur_strength);
-
-        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
-
-        glEnableVertexAttribArray(blendPosLoc);
-        glVertexAttribPointer(blendPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
-        glEnableVertexAttribArray(blendTexCoordLoc);
-        glVertexAttribPointer(blendTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
-
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
+        glUseProgram(blendProgram);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, rawTexture);
+        glUniform1i(locCurrent, 0);
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, historyTextures[prev]);
+        glUniform1i(locHistory, 1);
+        glUniform1f(locFactor, BLUR_STRENGTH);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
     }
 
+    // 3. UPSCALE & DRAW TO SCREEN
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, width, height);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glViewport(0, 0, width, height); // Restore full scale
+    
+    glUseProgram(drawProgram);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, historyTextures[curr]);
+    glUniform1i(locTexture, 0);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
 
-    glUseProgram(drawShaderProgram);
-
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, historyTextures[curr]);
-    glUniform1i(drawTextureLoc, 0);
-
-    glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexBuffer);
-
-    glEnableVertexAttribArray(drawPosLoc);
-    glVertexAttribPointer(drawPosLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
-    glEnableVertexAttribArray(drawTexCoordLoc);
-    glVertexAttribPointer(drawTexCoordLoc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
-
-    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, nullptr);
-
+    glBindVertexArray(0);
     pingPongIndex = prev;
 }
 
-static bool g_initialized = false;
-static int g_width = 0, g_height = 0;
-static EGLContext g_targetcontext = EGL_NO_CONTEXT;
-static EGLSurface g_targetsurface = EGL_NO_SURFACE;
-static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
-static void (*orig_input1)(void*, void*, void*) = nullptr;
-static int32_t (*orig_input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
+// =============================================================
+// 6. HOOK
+// =============================================================
 
-static void hook_input1(void* thiz, void* a1, void* a2) {
-    if (orig_input1) orig_input1(thiz, a1, a2);
-    if (thiz && g_initialized) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
-}
+static EGLBoolean (*orig_swap)(EGLDisplay, EGLSurface) = nullptr;
 
-static int32_t hook_input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
-    int32_t result = orig_input2 ? orig_input2(thiz, a1, a2, a3, a4, event) : 0;
-    if (result == 0 && event && *event && g_initialized) ImGui_ImplAndroid_HandleInputEvent(*event);
-    return result;
-}
-
-static void drawmenu() {
-    ImGui::SetNextWindowPos(ImVec2(10, 80), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(350, 180), ImGuiCond_FirstUseEver);
-
-    ImGui::Begin("Natural Motion Blur", nullptr);
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(16, 12));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
-    ImGui::SetWindowFontScale(1.2f);
-
-    ImGui::Checkbox("Enable Motion Blur", &motion_blur_enabled);
-    
-    if (motion_blur_enabled) {
-        ImGui::Spacing();
-        ImGui::Text("Blur Strength (Trail Length)");
-        ImGui::SliderFloat("##Strength", &blur_strength, 0.0f, 0.98f, "%.2f");
+static EGLBoolean hook_swap(EGLDisplay dpy, EGLSurface surf) {
+    if (orig_swap) {
+        EGLint w, h;
+        eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
+        eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+        
+        // Only run if the surface is valid game size
+        if (w > 100) render_effect(w, h);
+        
+        return orig_swap(dpy, surf);
     }
-
-    ImGui::PopStyleVar(2);
-    ImGui::End();
-}
-
-static void setup() {
-    if (g_initialized || g_width <= 0) return;
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.IniFilename = nullptr;
-    io.FontGlobalScale = 1.4f;
-    ImGui_ImplAndroid_Init();
-    ImGui_ImplOpenGL3_Init("#version 300 es");
-    g_initialized = true;
-}
-
-static void render() {
-    if (!g_initialized) return;
-
-    GLint last_prog; glGetIntegerv(GL_CURRENT_PROGRAM, &last_prog);
-    GLint last_tex; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex);
-    GLint last_array_buffer; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &last_array_buffer);
-    GLint last_element_array_buffer; glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &last_element_array_buffer);
-    GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
-    GLint last_viewport[4]; glGetIntegerv(GL_VIEWPORT, last_viewport);
-    GLboolean last_scissor = glIsEnabled(GL_SCISSOR_TEST);
-    GLboolean last_depth = glIsEnabled(GL_DEPTH_TEST);
-    GLboolean last_blend = glIsEnabled(GL_BLEND);
-
-    if (motion_blur_enabled) {
-        apply_motion_blur(g_width, g_height);
-    }
-
-    ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2((float)g_width, (float)g_height);
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame(g_width, g_height);
-    ImGui::NewFrame();
-    
-    drawmenu();
-    
-    ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-
-    glUseProgram(last_prog);
-    glBindTexture(GL_TEXTURE_2D, last_tex);
-    glBindBuffer(GL_ARRAY_BUFFER, last_array_buffer);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, last_element_array_buffer);
-    glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
-    glViewport(last_viewport[0], last_viewport[1], last_viewport[2], last_viewport[3]);
-    if (last_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
-    if (last_depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    if (last_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-}
-
-static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
-    if (!orig_eglswapbuffers) return EGL_FALSE;
-    EGLContext ctx = eglGetCurrentContext();
-    if (ctx == EGL_NO_CONTEXT || (g_targetcontext != EGL_NO_CONTEXT && (ctx != g_targetcontext || surf != g_targetsurface)))
-        return orig_eglswapbuffers(dpy, surf);
-    
-    EGLint w, h;
-    eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
-    eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-    if (w < 100 || h < 100) return orig_eglswapbuffers(dpy, surf);
-
-    if (g_targetcontext == EGL_NO_CONTEXT) { g_targetcontext = ctx; g_targetsurface = surf; }
-    g_width = w; g_height = h;
-    
-    setup();
-    render();
-    
-    return orig_eglswapbuffers(dpy, surf);
-}
-
-static void hookinput() {
-    void* sym = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
-    if (sym) GlossHook(sym, (void*)hook_input2, (void**)&orig_input2);
+    return EGL_FALSE;
 }
 
 static void* mainthread(void*) {
-    sleep(3);
+    sleep(1);
     GlossInit(true);
     GHandle hegl = GlossOpen("libEGL.so");
-
-    if (hegl) {
-        void* swap = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
-        if (swap) GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
-    }
-
-    hookinput();
+    void* swap = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
+    if(swap) GlossHook(swap, (void*)hook_swap, (void**)&orig_swap);
     return nullptr;
 }
 
 __attribute__((constructor))
-void display_init() {
+void lib_init() {
     pthread_t t;
     pthread_create(&t, nullptr, mainthread, nullptr);
 }
